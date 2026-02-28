@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sglang"
+name = "moonlang"
 dynamic = ["version"]
-description = "SGLang is a fast serving framework for large language models and vision language models."
+description = "MoonLang: SGLang + Mooncake - A high-performance LLM serving framework with advanced distributed KV cache and communication optimization."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -138,11 +138,11 @@ test = [
   "tabulate",
 ]
 
-dev = ["sglang[test]"]
+dev = ["moonlang[test]"]
 
 all = [
-  "sglang[diffusion]",
-  "sglang[tracing]",
+  "moonlang[diffusion]",
+  "moonlang[tracing]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -154,10 +154,11 @@ vsa = ["torch", "setuptools"]
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [project.scripts]
-sglang = "sglang.cli.main:main"
+moonlang = "moonlang.cli.main:main"
+sglang = "moonlang.cli.main:main"
 
 [tool.setuptools.package-data]
-"sglang" = [
+"moonlang" = [
   "srt/**/*",
   "jit_kernel/**/*"
 ]
@@ -186,7 +187,7 @@ exclude = [
 
 [tool.setuptools_scm]
 root = ".."
-version_file = "sglang/_version.py"
+version_file = "moonlang/_version.py"
 git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
 # Allow editable installs even when .git metadata is not available.
-fallback_version = "0.0.0.dev0"
+fallback_version = "0.1.0.dev0"
