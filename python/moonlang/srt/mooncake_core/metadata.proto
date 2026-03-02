@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+package moonlang.metadata;
+
+// Metadata service for global KV cache coordination
+service MetadataService {
+  // Query which nodes have a specific cache prefix
+  rpc QueryCache(QueryCacheRequest) returns (QueryCacheResponse);
+  
+  // Register local cache with the metadata server
+  rpc RegisterCache(RegisterCacheRequest) returns (RegisterCacheResponse);
+  
+  // Update node status (capacity, load, etc.)
+  rpc UpdateNodeStatus(UpdateNodeStatusRequest) returns (UpdateNodeStatusResponse);
+}
+
+// Query cache location
+message QueryCacheRequest {
+  string prefix_hash = 1;
+}
+
+message CacheLocation {
+  string node_id = 1;
+  repeated int32 kv_indices = 2;
+  double timestamp = 3;
+}
+
+message QueryCacheResponse {
+  repeated CacheLocation locations = 1;
+}
+
+// Register cache
+message RegisterCacheRequest {
+  string node_id = 1;
+  string prefix_hash = 2;
+  repeated int32 kv_indices = 3;
+}
+
+message RegisterCacheResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Update node status
+message NodeStatus {
+  int64 available_memory = 1;
+  int64 total_memory = 2;
+  int32 active_requests = 3;
+  double load_factor = 4;
+}
+
+message UpdateNodeStatusRequest {
+  string node_id = 1;
+  NodeStatus status = 2;
+}
+
+message UpdateNodeStatusResponse {
+  bool success = 1;
+}

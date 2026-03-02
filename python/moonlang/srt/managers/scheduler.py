@@ -368,6 +368,9 @@ class Scheduler(
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
+        # Init Mooncake transport layer for global KV cache sharing
+        self.init_mooncake_transport()
+
         # Init running status
         self.init_running_status()
 
@@ -737,6 +740,64 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def init_mooncake_transport(self):
+        """Initialize Mooncake transport layer for global KV cache sharing"""
+        server_args = self.server_args
+        
+        # Only initialize on the main scheduler rank
+        if self.tp_rank != 0 or self.pp_rank != 0:
+            self.mooncake_transport = None
+            return
+        
+        if not server_args.enable_global_cache:
+            self.mooncake_transport = None
+            logger.info("Global KV cache sharing is disabled")
+            return
+        
+        try:
+            from moonlang.srt.mooncake_core.config import MooncakeConfig
+            from moonlang.srt.mooncake_core.transport import MooncakeTransportLayer
+            
+            # Create Mooncake configuration
+            mooncake_config = MooncakeConfig(
+                enable_global_cache=True,
+                metadata_server_addr=server_args.global_cache_metadata_server,
+                cache_query_timeout=server_args.global_cache_query_timeout,
+                transfer_timeout=server_args.global_cache_transfer_timeout,
+                ib_device=server_args.mooncake_ib_device,
+            )
+            
+            # Validate configuration
+            mooncake_config.validate()
+            
+            # Create transport layer
+            self.mooncake_transport = MooncakeTransportLayer(mooncake_config)
+            
+            # Generate node ID (use hostname + rank)
+            import socket
+            hostname = socket.gethostname()
+            self.node_id = f"{hostname}_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank}"
+            
+            logger.info(
+                f"Mooncake transport layer initialized: node_id={self.node_id}, "
+                f"metadata_server={server_args.global_cache_metadata_server}"
+            )
+            
+            if self.mooncake_transport.is_available():
+                logger.info("Mooncake transfer engine is available")
+            else:
+                logger.warning("Mooncake transfer engine is not available")
+            
+            if self.mooncake_transport.is_global_cache_enabled():
+                logger.info("Global cache metadata service is connected")
+            else:
+                logger.warning("Global cache metadata service is not connected")
+                
+        except Exception as e:
+            logger.error(f"Failed to initialize Mooncake transport layer: {e}")
+            logger.warning("Global KV cache sharing will be disabled")
+            self.mooncake_transport = None
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1638,6 +1699,8 @@ class Scheduler(
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
+            # Query global cache before adding to queue
+            self._query_and_prepare_global_cache(req)
             self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
@@ -2981,6 +3044,201 @@ class Scheduler(
 
     def get_remote_instance_transfer_engine_info(self):
         return self.tp_worker.get_remote_instance_transfer_engine_info()
+
+    # ===================== Global KV Cache Methods =====================
+
+    def _query_and_prepare_global_cache(self, req: Req):
+        """
+        Query global cache and prepare for potential remote cache fetch.
+        
+        This method is called before adding request to queue.
+        It queries the metadata server to check if other nodes have cached
+        the prefix of this request.
+        
+        Args:
+            req: The request to process
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.is_global_cache_enabled():
+            return
+        
+        # Only query for requests with sufficient input length
+        if len(req.origin_input_ids) < 32:  # Skip very short prompts
+            return
+        
+        try:
+            # Compute prefix hash
+            prefix_hash = self.compute_prefix_hash(req.origin_input_ids)
+            
+            # Query global cache
+            cache_locations = self.query_global_cache(prefix_hash)
+            
+            if cache_locations:
+                # Store cache info in request for later use
+                req.global_cache_info = {
+                    "prefix_hash": prefix_hash,
+                    "locations": cache_locations,
+                    "query_time": time.time(),
+                }
+                logger.debug(
+                    f"Request {req.rid}: Found {len(cache_locations)} remote cache locations"
+                )
+            else:
+                req.global_cache_info = None
+                
+        except Exception as e:
+            logger.warning(f"Failed to query global cache for request {req.rid}: {e}")
+            req.global_cache_info = None
+
+    def _register_cache_after_prefill(self, req: Req):
+        """
+        Register cache to global metadata server after prefill.
+        
+        This method is called after a request completes prefill and
+        its KV cache is stored in the local RadixCache.
+        
+        Args:
+            req: The request that completed prefill
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.is_global_cache_enabled():
+            return
+        
+        # Only register for requests with sufficient length
+        if len(req.origin_input_ids) < 32:
+            return
+        
+        try:
+            # Compute prefix hash
+            prefix_hash = self.compute_prefix_hash(req.origin_input_ids)
+            
+            # Get KV indices from the request
+            # Note: This assumes req has kv_indices attribute set by RadixCache
+            if hasattr(req, 'prefix_indices') and req.prefix_indices:
+                kv_indices = req.prefix_indices
+                
+                # Register to global cache
+                success = self.register_cache_to_global(prefix_hash, kv_indices)
+                
+                if success:
+                    logger.debug(
+                        f"Request {req.rid}: Registered cache to global "
+                        f"(prefix={prefix_hash}, indices={len(kv_indices)})"
+                    )
+            else:
+                logger.debug(f"Request {req.rid}: No KV indices to register")
+                
+        except Exception as e:
+            logger.warning(f"Failed to register cache for request {req.rid}: {e}")
+
+    def compute_prefix_hash(self, input_ids: List[int]) -> str:
+        """
+        Compute hash for cache prefix.
+        
+        Args:
+            input_ids: Input token IDs
+            
+        Returns:
+            Hash string for the prefix
+        """
+        import hashlib
+        
+        # Use first N tokens as prefix (configurable)
+        prefix_length = min(len(input_ids), 128)  # Use first 128 tokens
+        prefix_tokens = tuple(input_ids[:prefix_length])
+        
+        # Compute hash
+        hash_obj = hashlib.sha256(str(prefix_tokens).encode())
+        return hash_obj.hexdigest()[:16]  # Use first 16 chars
+
+    def query_global_cache(self, prefix_hash: str) -> List[Dict]:
+        """
+        Query global cache for a given prefix.
+        
+        Args:
+            prefix_hash: Hash of the cache prefix
+            
+        Returns:
+            List of cache locations
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.is_global_cache_enabled():
+            return []
+        
+        try:
+            locations = self.mooncake_transport.query_cache_location(prefix_hash)
+            if locations:
+                logger.debug(
+                    f"Found {len(locations)} remote cache locations for prefix {prefix_hash}"
+                )
+            return locations
+        except Exception as e:
+            logger.error(f"Failed to query global cache: {e}")
+            return []
+
+    def register_cache_to_global(self, prefix_hash: str, kv_indices: List[int]) -> bool:
+        """
+        Register local cache to global metadata server.
+        
+        Args:
+            prefix_hash: Hash of the cache prefix
+            kv_indices: KV cache indices
+            
+        Returns:
+            True if registration successful
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.is_global_cache_enabled():
+            return False
+        
+        try:
+            success = self.mooncake_transport.register_cache(
+                self.node_id, prefix_hash, kv_indices
+            )
+            if success:
+                logger.debug(
+                    f"Registered cache to global: prefix={prefix_hash}, "
+                    f"indices={len(kv_indices)}"
+                )
+            return success
+        except Exception as e:
+            logger.error(f"Failed to register cache to global: {e}")
+            return False
+
+    def fetch_remote_cache(
+        self,
+        session_id: str,
+        remote_node: str,
+        src_kv_indices: List[int],
+        dst_kv_indices: List[int],
+    ) -> bool:
+        """
+        Fetch KV cache from remote node.
+        
+        Args:
+            session_id: Mooncake session ID
+            remote_node: Remote node ID
+            src_kv_indices: Source KV indices on remote node
+            dst_kv_indices: Destination KV indices on local node
+            
+        Returns:
+            True if transfer successful
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.is_available():
+            return False
+        
+        try:
+            # TODO: Get remote node addresses
+            # This requires coordination with the remote node to get memory addresses
+            # For now, this is a placeholder
+            logger.info(
+                f"Fetching cache from {remote_node}: "
+                f"src_indices={len(src_kv_indices)}, dst_indices={len(dst_kv_indices)}"
+            )
+            
+            # In Phase 2, we will implement the actual transfer logic
+            # using self.mooncake_transport.transfer_kv_cache()
+            
+            return False  # Not implemented yet
+        except Exception as e:
+            logger.error(f"Failed to fetch remote cache: {e}")
+            return False
 
 
 class IdleSleeper:

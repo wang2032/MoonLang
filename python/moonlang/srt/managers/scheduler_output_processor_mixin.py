@@ -177,6 +177,8 @@ class SchedulerOutputProcessorMixin:
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
+                        # Register cache to global metadata server
+                        self._register_cache_after_prefill(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 

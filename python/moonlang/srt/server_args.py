@@ -519,6 +519,12 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
 
+    # Global KV Cache (MoonLang)
+    enable_global_cache: bool = False
+    global_cache_metadata_server: Optional[str] = None  # "ip:port"
+    global_cache_query_timeout: float = 1.0
+    global_cache_transfer_timeout: float = 10.0
+
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
