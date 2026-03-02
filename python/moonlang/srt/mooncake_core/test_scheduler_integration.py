@@ -57,7 +57,7 @@ def test_scheduler_mooncake_init():
         enable_global_cache=True,
         metadata_server_addr="localhost:8999",
         cache_query_timeout=1.0,
-        transfer_timeout=10.0,
+        cache_transfer_timeout=10.0,
         ib_device="mlx5_0",
     )
     
