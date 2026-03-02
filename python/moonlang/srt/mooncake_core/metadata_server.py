@@ -229,50 +229,55 @@ class GlobalCacheMetadataServer:
             self.grpc_server.stop(0)
 
 
-class MetadataServicer(metadata_pb2_grpc.MetadataServiceServicer):
-    """gRPC servicer implementation"""
-    
-    def __init__(self, server: GlobalCacheMetadataServer):
-        self.server = server
-    
-    def QueryCache(self, request, context):
-        """Handle QueryCache RPC"""
-        locations = self.server.query_cache(request.prefix_hash)
+if GRPC_AVAILABLE:
+    class MetadataServicer(metadata_pb2_grpc.MetadataServiceServicer):
+        """gRPC servicer implementation"""
         
-        response = metadata_pb2.QueryCacheResponse()
-        for loc in locations:
-            cache_loc = response.locations.add()
-            cache_loc.node_id = loc["node_id"]
-            cache_loc.kv_indices.extend(loc["kv_indices"])
-            cache_loc.timestamp = loc["timestamp"]
+        def __init__(self, server: GlobalCacheMetadataServer):
+            self.server = server
         
-        return response
-    
-    def RegisterCache(self, request, context):
-        """Handle RegisterCache RPC"""
-        success = self.server.register_cache(
-            request.node_id,
-            request.prefix_hash,
-            list(request.kv_indices),
-        )
+        def QueryCache(self, request, context):
+            """Handle QueryCache RPC"""
+            locations = self.server.query_cache(request.prefix_hash)
+            
+            response = metadata_pb2.QueryCacheResponse()
+            for loc in locations:
+                cache_loc = response.locations.add()
+                cache_loc.node_id = loc["node_id"]
+                cache_loc.kv_indices.extend(loc["kv_indices"])
+                cache_loc.timestamp = loc["timestamp"]
+            
+            return response
         
-        return metadata_pb2.RegisterCacheResponse(
-            success=success,
-            message="Cache registered successfully" if success else "Registration failed",
-        )
-    
-    def UpdateNodeStatus(self, request, context):
-        """Handle UpdateNodeStatus RPC"""
-        status = {
-            "available_memory": request.status.available_memory,
-            "total_memory": request.status.total_memory,
-            "active_requests": request.status.active_requests,
-            "load_factor": request.status.load_factor,
-        }
+        def RegisterCache(self, request, context):
+            """Handle RegisterCache RPC"""
+            success = self.server.register_cache(
+                request.node_id,
+                request.prefix_hash,
+                list(request.kv_indices),
+            )
+            
+            return metadata_pb2.RegisterCacheResponse(
+                success=success,
+                message="Cache registered successfully" if success else "Registration failed",
+            )
         
-        success = self.server.update_node_status(request.node_id, status)
-        
-        return metadata_pb2.UpdateNodeStatusResponse(success=success)
+        def UpdateNodeStatus(self, request, context):
+            """Handle UpdateNodeStatus RPC"""
+            status = {
+                "available_memory": request.status.available_memory,
+                "total_memory": request.status.total_memory,
+                "active_requests": request.status.active_requests,
+                "load_factor": request.status.load_factor,
+            }
+            
+            success = self.server.update_node_status(request.node_id, status)
+            
+            return metadata_pb2.UpdateNodeStatusResponse(success=success)
+else:
+    # Dummy class when gRPC is not available
+    class MetadataServicer:
+        pass
 
 
 def main():
