@@ -12,6 +12,12 @@ service MetadataService {
   
   // Update node status (capacity, load, etc.)
   rpc UpdateNodeStatus(UpdateNodeStatusRequest) returns (UpdateNodeStatusResponse);
+  
+  // Phase 2: Query memory addresses for remote cache transfer
+  rpc QueryMemoryAddresses(QueryMemoryAddressesRequest) returns (QueryMemoryAddressesResponse);
+  
+  // Phase 2: Register memory addresses for a node
+  rpc RegisterMemoryAddresses(RegisterMemoryAddressesRequest) returns (RegisterMemoryAddressesResponse);
 }
 
 // Query cache location
@@ -56,4 +62,37 @@ message UpdateNodeStatusRequest {
 
 message UpdateNodeStatusResponse {
   bool success = 1;
+}
+
+// Phase 2: Query memory addresses
+message QueryMemoryAddressesRequest {
+  string node_id = 1;
+  string prefix_hash = 2;
+  repeated int32 kv_indices = 3;
+}
+
+message MemoryAddress {
+  int32 kv_index = 1;
+  repeated int64 addresses = 2;  // Memory addresses for each layer
+}
+
+message QueryMemoryAddressesResponse {
+  bool success = 1;
+  repeated MemoryAddress memory_addresses = 2;
+  string endpoint = 3;  // Node endpoint for RDMA connection
+  string session_id = 4;  // Mooncake session ID
+}
+
+// Phase 2: Register memory addresses
+message RegisterMemoryAddressesRequest {
+  string node_id = 1;
+  string endpoint = 2;
+  string session_id = 3;
+  repeated int64 kv_data_ptrs = 4;  // Base pointers for KV data
+  repeated int32 kv_item_lens = 5;  // Item lengths for each layer
+}
+
+message RegisterMemoryAddressesResponse {
+  bool success = 1;
+  string message = 2;
 }

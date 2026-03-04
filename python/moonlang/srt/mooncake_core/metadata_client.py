@@ -10,7 +10,9 @@ from typing import Dict, List, Optional
 
 try:
     import grpc
-    from moonlang.srt.mooncake_core import metadata_pb2, metadata_pb2_grpc
+    # Direct import to avoid __init__.py issues
+    import moonlang.srt.mooncake_core.metadata_pb2 as metadata_pb2
+    import moonlang.srt.mooncake_core.metadata_pb2_grpc as metadata_pb2_grpc
     GRPC_AVAILABLE = True
 except ImportError:
     GRPC_AVAILABLE = False
@@ -218,3 +220,131 @@ class MetadataClient:
         """Close the gRPC channel"""
         if self.channel:
             self.channel.close()
+    
+    def query_memory_addresses(
+        self, node_id: str, prefix_hash: str, kv_indices: List[int]
+    ) -> Dict:
+        """
+        Query memory addresses for KV cache indices on a remote node.
+        
+        Phase 2: This enables RDMA transfer by getting remote memory addresses.
+        
+        Args:
+            node_id: Target node ID
+            prefix_hash: Cache prefix hash
+            kv_indices: KV cache indices to query
+            
+        Returns:
+            Dictionary with:
+            - success: bool
+            - memory_addresses: List[Dict] with kv_index and addresses
+            - endpoint: str (node IP address)
+            - session_id: str (Mooncake session ID)
+        """
+        if not self.stub:
+            logger.warning("gRPC stub not available, cannot query memory addresses")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
+        
+        try:
+            request = metadata_pb2.QueryMemoryAddressesRequest(
+                node_id=node_id,
+                prefix_hash=prefix_hash,
+                kv_indices=kv_indices,
+            )
+            response = self.stub.QueryMemoryAddresses(request, timeout=self.timeout)
+            
+            # Convert response to dict format
+            memory_addresses = []
+            for mem_addr in response.memory_addresses:
+                memory_addresses.append({
+                    "kv_index": mem_addr.kv_index,
+                    "addresses": list(mem_addr.addresses),
+                })
+            
+            result = {
+                "success": response.success,
+                "memory_addresses": memory_addresses,
+                "endpoint": response.endpoint,
+                "session_id": response.session_id,
+            }
+            
+            logger.debug(
+                f"Query memory addresses: node={node_id}, "
+                f"indices={len(kv_indices)}, success={response.success}"
+            )
+            
+            return result
+        except grpc.RpcError as e:
+            logger.error(f"Failed to query memory addresses: {e}")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error querying memory addresses: {e}")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
+    
+    def register_memory_addresses(
+        self,
+        node_id: str,
+        endpoint: str,
+        session_id: str,
+        kv_data_ptrs: List[int],
+        kv_item_lens: List[int],
+    ) -> bool:
+        """
+        Register local memory addresses with metadata server.
+        
+        Phase 2: This allows other nodes to query our memory addresses for RDMA.
+        
+        Args:
+            node_id: Local node ID
+            endpoint: Local endpoint (IP address)
+            session_id: Mooncake session ID
+            kv_data_ptrs: Base pointers for KV data
+            kv_item_lens: Item lengths for each layer
+            
+        Returns:
+            True if registration successful
+        """
+        if not self.stub:
+            logger.warning("gRPC stub not available, cannot register memory addresses")
+            return False
+        
+        try:
+            request = metadata_pb2.RegisterMemoryAddressesRequest(
+                node_id=node_id,
+                endpoint=endpoint,
+                session_id=session_id,
+                kv_data_ptrs=kv_data_ptrs,
+                kv_item_lens=kv_item_lens,
+            )
+            response = self.stub.RegisterMemoryAddresses(request, timeout=self.timeout)
+            
+            if response.success:
+                logger.info(
+                    f"Registered memory addresses: node={node_id}, "
+                    f"endpoint={endpoint}, ptrs={len(kv_data_ptrs)}"
+                )
+            else:
+                logger.warning(f"Failed to register memory addresses: {response.message}")
+            
+            return response.success
+        except grpc.RpcError as e:
+            logger.error(f"Failed to register memory addresses: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error registering memory addresses: {e}")
+            return False

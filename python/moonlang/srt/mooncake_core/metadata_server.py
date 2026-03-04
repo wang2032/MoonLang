@@ -39,6 +39,9 @@ class GlobalCacheMetadataServer:
         # Node registry: node_id -> node info
         self.node_registry: Dict[str, Dict] = {}
         
+        # Phase 2: Memory registry: node_id -> memory info
+        self.memory_registry: Dict[str, Dict] = {}
+        
         # Access statistics
         self.access_stats: Dict[str, int] = defaultdict(int)
         
@@ -150,11 +153,115 @@ class GlobalCacheMetadataServer:
         return {
             "total_cache_entries": len(self.cache_registry),
             "total_nodes": len(self.node_registry),
+            "total_memory_registrations": len(self.memory_registry),
             "total_queries": sum(self.access_stats.values()),
             "top_accessed": sorted(
                 self.access_stats.items(), key=lambda x: x[1], reverse=True
             )[:10],
         }
+    
+    def register_memory_addresses(
+        self,
+        node_id: str,
+        endpoint: str,
+        session_id: str,
+        kv_data_ptrs: List[int],
+        kv_item_lens: List[int],
+    ) -> bool:
+        """
+        Register node's memory addresses for RDMA transfer.
+        
+        Args:
+            node_id: Node ID
+            endpoint: Node endpoint (IP address)
+            session_id: Mooncake session ID
+            kv_data_ptrs: Base pointers for KV data
+            kv_item_lens: Item lengths for each layer
+            
+        Returns:
+            True if registration successful
+        """
+        try:
+            self.memory_registry[node_id] = {
+                "endpoint": endpoint,
+                "session_id": session_id,
+                "kv_data_ptrs": kv_data_ptrs,
+                "kv_item_lens": kv_item_lens,
+                "last_update": time.time(),
+            }
+            
+            logger.info(
+                f"Registered memory addresses: node={node_id}, "
+                f"endpoint={endpoint}, ptrs={len(kv_data_ptrs)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to register memory addresses: {e}")
+            return False
+    
+    def query_memory_addresses(
+        self, node_id: str, prefix_hash: str, kv_indices: List[int]
+    ) -> Dict:
+        """
+        Query memory addresses for KV cache indices on a specific node.
+        
+        Args:
+            node_id: Target node ID
+            prefix_hash: Cache prefix hash
+            kv_indices: KV cache indices to query
+            
+        Returns:
+            Dictionary with memory addresses and connection info
+        """
+        if node_id not in self.memory_registry:
+            logger.warning(f"Node {node_id} not found in memory registry")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
+        
+        try:
+            mem_info = self.memory_registry[node_id]
+            kv_data_ptrs = mem_info["kv_data_ptrs"]
+            kv_item_lens = mem_info["kv_item_lens"]
+            
+            # Calculate memory addresses for each KV index
+            memory_addresses = []
+            for kv_idx in kv_indices:
+                addresses = []
+                # For each layer, calculate address
+                for layer_id in range(len(kv_data_ptrs)):
+                    base_ptr = kv_data_ptrs[layer_id]
+                    item_len = kv_item_lens[layer_id]
+                    addr = base_ptr + kv_idx * item_len
+                    addresses.append(addr)
+                
+                memory_addresses.append({
+                    "kv_index": kv_idx,
+                    "addresses": addresses,
+                })
+            
+            logger.debug(
+                f"Query memory addresses: node={node_id}, "
+                f"indices={len(kv_indices)}, addresses={len(memory_addresses)}"
+            )
+            
+            return {
+                "success": True,
+                "memory_addresses": memory_addresses,
+                "endpoint": mem_info["endpoint"],
+                "session_id": mem_info["session_id"],
+            }
+        except Exception as e:
+            logger.error(f"Failed to query memory addresses: {e}")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
     
     def cleanup_stale_entries(self, max_age: float = 300.0):
         """
@@ -190,7 +297,9 @@ class GlobalCacheMetadataServer:
         # Import gRPC modules here to avoid circular import
         try:
             import grpc
-            from moonlang.srt.mooncake_core import metadata_pb2, metadata_pb2_grpc
+            # Direct import to avoid __init__.py issues
+            import moonlang.srt.mooncake_core.metadata_pb2 as metadata_pb2
+            import moonlang.srt.mooncake_core.metadata_pb2_grpc as metadata_pb2_grpc
         except ImportError as e:
             logger.error(
                 f"gRPC is not available: {e}. "
@@ -247,6 +356,41 @@ class GlobalCacheMetadataServer:
                 success = server_instance.update_node_status(request.node_id, status)
                 
                 return metadata_pb2.UpdateNodeStatusResponse(success=success)
+            
+            def QueryMemoryAddresses(self, request, context):
+                """Handle QueryMemoryAddresses RPC (Phase 2)"""
+                result = server_instance.query_memory_addresses(
+                    request.node_id,
+                    request.prefix_hash,
+                    list(request.kv_indices),
+                )
+                
+                response = metadata_pb2.QueryMemoryAddressesResponse()
+                response.success = result["success"]
+                response.endpoint = result["endpoint"]
+                response.session_id = result["session_id"]
+                
+                for mem_addr in result["memory_addresses"]:
+                    addr_msg = response.memory_addresses.add()
+                    addr_msg.kv_index = mem_addr["kv_index"]
+                    addr_msg.addresses.extend(mem_addr["addresses"])
+                
+                return response
+            
+            def RegisterMemoryAddresses(self, request, context):
+                """Handle RegisterMemoryAddresses RPC (Phase 2)"""
+                success = server_instance.register_memory_addresses(
+                    request.node_id,
+                    request.endpoint,
+                    request.session_id,
+                    list(request.kv_data_ptrs),
+                    list(request.kv_item_lens),
+                )
+                
+                return metadata_pb2.RegisterMemoryAddressesResponse(
+                    success=success,
+                    message="Memory addresses registered successfully" if success else "Registration failed",
+                )
         
         # Add servicer
         metadata_pb2_grpc.add_MetadataServiceServicer_to_server(

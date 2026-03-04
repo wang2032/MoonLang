@@ -3053,7 +3053,7 @@ class Scheduler(
         
         This method is called before adding request to queue.
         It queries the metadata server to check if other nodes have cached
-        the prefix of this request.
+        the prefix of this request, and attempts to fetch the cache if available.
         
         Args:
             req: The request to process
@@ -3079,9 +3079,40 @@ class Scheduler(
                     "locations": cache_locations,
                     "query_time": time.time(),
                 }
+                
                 logger.debug(
                     f"Request {req.rid}: Found {len(cache_locations)} remote cache locations"
                 )
+                
+                # Phase 2: Attempt to fetch remote cache
+                if self.server_args.enable_remote_cache_fetch:
+                    for node_id, kv_indices in cache_locations:
+                        # Skip if it's our own cache
+                        if node_id == self.node_id:
+                            logger.debug(f"Request {req.rid}: Cache is local, skipping fetch")
+                            continue
+                        
+                        # Attempt to fetch from remote node
+                        logger.info(
+                            f"Request {req.rid}: Attempting to fetch cache from {node_id}"
+                        )
+                        
+                        success = self.fetch_remote_cache(
+                            req=req,
+                            remote_node_id=node_id,
+                            src_kv_indices=kv_indices,
+                        )
+                        
+                        if success:
+                            logger.info(
+                                f"Request {req.rid}: Successfully fetched cache from {node_id}"
+                            )
+                            req.remote_cache_hit = True
+                            break  # Successfully fetched, no need to try other nodes
+                        else:
+                            logger.debug(
+                                f"Request {req.rid}: Failed to fetch cache from {node_id}, trying next"
+                            )
             else:
                 req.global_cache_info = None
                 
@@ -3203,42 +3234,201 @@ class Scheduler(
 
     def fetch_remote_cache(
         self,
-        session_id: str,
-        remote_node: str,
+        req: Req,
+        remote_node_id: str,
         src_kv_indices: List[int],
-        dst_kv_indices: List[int],
     ) -> bool:
         """
-        Fetch KV cache from remote node.
+        Fetch KV cache from remote node using Mooncake RDMA.
+        
+        This method:
+        1. Queries remote node for memory addresses
+        2. Allocates local KV cache slots
+        3. Initiates RDMA transfer from remote to local
+        4. Updates request's prefix_indices
         
         Args:
-            session_id: Mooncake session ID
-            remote_node: Remote node ID
+            req: The request object
+            remote_node_id: Remote node ID
             src_kv_indices: Source KV indices on remote node
-            dst_kv_indices: Destination KV indices on local node
             
         Returns:
             True if transfer successful
         """
         if not self.mooncake_transport or not self.mooncake_transport.is_available():
+            logger.debug("Mooncake transport not available, skipping remote cache fetch")
             return False
         
         try:
-            # TODO: Get remote node addresses
-            # This requires coordination with the remote node to get memory addresses
-            # For now, this is a placeholder
-            logger.info(
-                f"Fetching cache from {remote_node}: "
-                f"src_indices={len(src_kv_indices)}, dst_indices={len(dst_kv_indices)}"
+            # Step 1: Query remote node for memory addresses
+            remote_addrs = self._query_remote_memory_addresses(
+                remote_node_id, src_kv_indices
+            )
+            if not remote_addrs:
+                logger.debug(f"Failed to get memory addresses from {remote_node_id}")
+                return False
+            
+            # Step 2: Allocate local KV cache slots
+            num_tokens = len(src_kv_indices) * self.page_size
+            dst_kv_indices = self._allocate_local_kv_slots(num_tokens)
+            if not dst_kv_indices:
+                logger.warning("Failed to allocate local KV cache slots")
+                return False
+            
+            # Step 3: Get local memory addresses
+            local_addrs = self._get_local_memory_addresses(dst_kv_indices)
+            if not local_addrs:
+                logger.warning("Failed to get local memory addresses")
+                self._free_local_kv_slots(dst_kv_indices)
+                return False
+            
+            # Step 4: Initiate RDMA transfer
+            session_id = self.mooncake_transport.engine.get_session_id() if self.mooncake_transport.engine else f"session_{self.node_id}"
+            
+            success = self.mooncake_transport.transfer_kv_cache(
+                session_id=session_id,
+                src_addrs=remote_addrs,
+                dst_addrs=local_addrs,
+                lengths=[self.kv_args.kv_item_lens[0]] * len(remote_addrs),
             )
             
-            # In Phase 2, we will implement the actual transfer logic
-            # using self.mooncake_transport.transfer_kv_cache()
-            
-            return False  # Not implemented yet
+            if success:
+                # Step 5: Update request's prefix_indices
+                req.prefix_indices = dst_kv_indices
+                req.remote_cache_fetched = True
+                
+                logger.info(
+                    f"Successfully fetched {len(src_kv_indices)} KV cache blocks "
+                    f"from {remote_node_id} for request {req.rid}"
+                )
+                return True
+            else:
+                logger.warning(f"RDMA transfer failed from {remote_node_id}")
+                self._free_local_kv_slots(dst_kv_indices)
+                return False
+                
         except Exception as e:
             logger.error(f"Failed to fetch remote cache: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
+    
+    def _query_remote_memory_addresses(
+        self, remote_node_id: str, kv_indices: List[int]
+    ) -> Optional[List[int]]:
+        """
+        Query remote node for KV cache memory addresses.
+        
+        This uses the metadata server to get memory addresses from the remote node.
+        
+        Args:
+            remote_node_id: Remote node ID
+            kv_indices: KV cache indices on remote node
+            
+        Returns:
+            List of memory addresses, or None if failed
+        """
+        if not self.mooncake_transport or not self.mooncake_transport.metadata_client:
+            return None
+        
+        try:
+            # Query memory addresses through metadata server
+            result = self.mooncake_transport.query_memory_addresses(
+                node_id=remote_node_id,
+                prefix_hash="",  # Not needed for address query
+                kv_indices=kv_indices,
+            )
+            
+            if not result["success"]:
+                logger.debug(f"Failed to query memory addresses from {remote_node_id}")
+                return None
+            
+            # Extract addresses from result
+            addresses = []
+            for mem_addr in result["memory_addresses"]:
+                addresses.extend(mem_addr["addresses"])
+            
+            logger.debug(
+                f"Got {len(addresses)} memory addresses from {remote_node_id}"
+            )
+            return addresses
+        except Exception as e:
+            logger.error(f"Failed to query remote memory addresses: {e}")
+            return None
+    
+    def _allocate_local_kv_slots(self, num_tokens: int) -> Optional[List[int]]:
+        """
+        Allocate local KV cache slots for incoming remote cache.
+        
+        Args:
+            num_tokens: Number of tokens to allocate
+            
+        Returns:
+            List of allocated KV indices, or None if failed
+        """
+        try:
+            # Use the existing token_to_kv_pool allocator
+            num_pages = (num_tokens + self.page_size - 1) // self.page_size
+            kv_indices = self.token_to_kv_pool_allocator.alloc(num_pages)
+            
+            if kv_indices is None or len(kv_indices) < num_pages:
+                logger.warning(f"Failed to allocate {num_pages} KV cache pages")
+                return None
+            
+            return kv_indices
+        except Exception as e:
+            logger.error(f"Failed to allocate local KV slots: {e}")
+            return None
+    
+    def _free_local_kv_slots(self, kv_indices: List[int]):
+        """Free allocated KV cache slots"""
+        try:
+            if kv_indices:
+                self.token_to_kv_pool_allocator.free(kv_indices)
+        except Exception as e:
+            logger.error(f"Failed to free local KV slots: {e}")
+    
+    def _get_local_memory_addresses(self, kv_indices: List[int]) -> Optional[List[int]]:
+        """
+        Get local GPU memory addresses for KV cache indices.
+        
+        Args:
+            kv_indices: Local KV cache indices
+            
+        Returns:
+            List of memory addresses, or None if failed
+        """
+        try:
+            # Get KV data pointers from kv_args
+            if not hasattr(self, 'kv_args') or not self.kv_args:
+                logger.warning("kv_args not available")
+                return None
+            
+            kv_data_ptrs = self.kv_args.kv_data_ptrs
+            kv_item_lens = self.kv_args.kv_item_lens
+            
+            if not kv_data_ptrs or not kv_item_lens:
+                logger.warning("KV data pointers not available")
+                return None
+            
+            # Calculate memory addresses for each KV index
+            # Assuming MHA architecture with K and V separate
+            addresses = []
+            for kv_idx in kv_indices:
+                # For each layer, calculate K and V addresses
+                for layer_id in range(len(kv_data_ptrs) // 2):
+                    k_ptr = kv_data_ptrs[layer_id]
+                    k_addr = k_ptr + kv_idx * kv_item_lens[layer_id]
+                    addresses.append(k_addr)
+                    
+                    v_ptr = kv_data_ptrs[len(kv_data_ptrs) // 2 + layer_id]
+                    v_addr = v_ptr + kv_idx * kv_item_lens[len(kv_data_ptrs) // 2 + layer_id]
+                    addresses.append(v_addr)
+            
+            return addresses
+        except Exception as e:
+            logger.error(f"Failed to get local memory addresses: {e}")
+            return None
 
 
 class IdleSleeper:

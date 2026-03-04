@@ -524,6 +524,8 @@ class ServerArgs:
     global_cache_metadata_server: Optional[str] = None  # "ip:port"
     global_cache_query_timeout: float = 1.0
     global_cache_transfer_timeout: float = 10.0
+    enable_remote_cache_fetch: bool = True  # Phase 2: Enable actual RDMA transfer
+    enable_cache_aware_scheduling: bool = False  # Phase 2: Route requests to nodes with cache
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None

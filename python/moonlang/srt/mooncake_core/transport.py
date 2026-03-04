@@ -232,3 +232,82 @@ class MooncakeTransportLayer:
         """Check if global cache is enabled"""
         return self.config.enable_global_cache and self.metadata_client is not None
 
+
+    def register_memory_addresses(
+        self,
+        node_id: str,
+        endpoint: str,
+        session_id: str,
+        kv_data_ptrs: List[int],
+        kv_item_lens: List[int],
+    ) -> bool:
+        """
+        Register local memory addresses with metadata server.
+        
+        Phase 2: This allows other nodes to query our memory layout for RDMA transfer.
+        
+        Args:
+            node_id: Local node ID
+            endpoint: Local endpoint (IP address)
+            session_id: Mooncake session ID
+            kv_data_ptrs: Base pointers for KV data
+            kv_item_lens: Item lengths for each layer
+            
+        Returns:
+            True if registration successful
+        """
+        if not self.metadata_client:
+            logger.warning("Metadata client not available")
+            return False
+        
+        try:
+            return self.metadata_client.register_memory_addresses(
+                node_id=node_id,
+                endpoint=endpoint,
+                session_id=session_id,
+                kv_data_ptrs=kv_data_ptrs,
+                kv_item_lens=kv_item_lens,
+            )
+        except Exception as e:
+            logger.error(f"Failed to register memory addresses: {e}")
+            return False
+    
+    def query_memory_addresses(
+        self, node_id: str, prefix_hash: str, kv_indices: List[int]
+    ) -> dict:
+        """
+        Query memory addresses from a remote node.
+        
+        Phase 2: Get remote memory addresses for RDMA transfer.
+        
+        Args:
+            node_id: Target node ID
+            prefix_hash: Cache prefix hash
+            kv_indices: KV cache indices
+            
+        Returns:
+            Dictionary with memory addresses and connection info
+        """
+        if not self.metadata_client:
+            logger.warning("Metadata client not available")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
+        
+        try:
+            return self.metadata_client.query_memory_addresses(
+                node_id=node_id,
+                prefix_hash=prefix_hash,
+                kv_indices=kv_indices,
+            )
+        except Exception as e:
+            logger.error(f"Failed to query memory addresses: {e}")
+            return {
+                "success": False,
+                "memory_addresses": [],
+                "endpoint": "",
+                "session_id": "",
+            }
