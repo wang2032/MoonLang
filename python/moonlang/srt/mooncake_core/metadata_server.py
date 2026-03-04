@@ -11,16 +11,6 @@ from collections import defaultdict
 from concurrent import futures
 from typing import Dict, List
 
-try:
-    import grpc
-    from moonlang.srt.mooncake_core import metadata_pb2, metadata_pb2_grpc
-    GRPC_AVAILABLE = True
-except ImportError:
-    GRPC_AVAILABLE = False
-    grpc = None
-    metadata_pb2 = None
-    metadata_pb2_grpc = None
-
 logger = logging.getLogger(__name__)
 
 
@@ -197,10 +187,14 @@ class GlobalCacheMetadataServer:
     
     def start(self):
         """Start the metadata server"""
-        if not GRPC_AVAILABLE:
+        # Import gRPC modules here to avoid circular import
+        try:
+            import grpc
+            from moonlang.srt.mooncake_core import metadata_pb2, metadata_pb2_grpc
+        except ImportError as e:
             logger.error(
-                "gRPC is not available. Please install grpcio and grpcio-tools: "
-                "pip install grpcio grpcio-tools"
+                f"gRPC is not available: {e}. "
+                "Please install grpcio and grpcio-tools: pip install grpcio grpcio-tools"
             )
             return
         
@@ -209,9 +203,54 @@ class GlobalCacheMetadataServer:
         # Create gRPC server
         self.grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
         
+        # Create servicer class dynamically to avoid import issues
+        server_instance = self
+        
+        class MetadataServicer(metadata_pb2_grpc.MetadataServiceServicer):
+            """gRPC servicer implementation"""
+            
+            def QueryCache(self, request, context):
+                """Handle QueryCache RPC"""
+                locations = server_instance.query_cache(request.prefix_hash)
+                
+                response = metadata_pb2.QueryCacheResponse()
+                for loc in locations:
+                    cache_loc = response.locations.add()
+                    cache_loc.node_id = loc["node_id"]
+                    cache_loc.kv_indices.extend(loc["kv_indices"])
+                    cache_loc.timestamp = loc["timestamp"]
+                
+                return response
+            
+            def RegisterCache(self, request, context):
+                """Handle RegisterCache RPC"""
+                success = server_instance.register_cache(
+                    request.node_id,
+                    request.prefix_hash,
+                    list(request.kv_indices),
+                )
+                
+                return metadata_pb2.RegisterCacheResponse(
+                    success=success,
+                    message="Cache registered successfully" if success else "Registration failed",
+                )
+            
+            def UpdateNodeStatus(self, request, context):
+                """Handle UpdateNodeStatus RPC"""
+                status = {
+                    "available_memory": request.status.available_memory,
+                    "total_memory": request.status.total_memory,
+                    "active_requests": request.status.active_requests,
+                    "load_factor": request.status.load_factor,
+                }
+                
+                success = server_instance.update_node_status(request.node_id, status)
+                
+                return metadata_pb2.UpdateNodeStatusResponse(success=success)
+        
         # Add servicer
         metadata_pb2_grpc.add_MetadataServiceServicer_to_server(
-            MetadataServicer(self), self.grpc_server
+            MetadataServicer(), self.grpc_server
         )
         
         # Bind to port
@@ -227,57 +266,6 @@ class GlobalCacheMetadataServer:
         except KeyboardInterrupt:
             logger.info("Shutting down metadata server")
             self.grpc_server.stop(0)
-
-
-if GRPC_AVAILABLE:
-    class MetadataServicer(metadata_pb2_grpc.MetadataServiceServicer):
-        """gRPC servicer implementation"""
-        
-        def __init__(self, server: GlobalCacheMetadataServer):
-            self.server = server
-        
-        def QueryCache(self, request, context):
-            """Handle QueryCache RPC"""
-            locations = self.server.query_cache(request.prefix_hash)
-            
-            response = metadata_pb2.QueryCacheResponse()
-            for loc in locations:
-                cache_loc = response.locations.add()
-                cache_loc.node_id = loc["node_id"]
-                cache_loc.kv_indices.extend(loc["kv_indices"])
-                cache_loc.timestamp = loc["timestamp"]
-            
-            return response
-        
-        def RegisterCache(self, request, context):
-            """Handle RegisterCache RPC"""
-            success = self.server.register_cache(
-                request.node_id,
-                request.prefix_hash,
-                list(request.kv_indices),
-            )
-            
-            return metadata_pb2.RegisterCacheResponse(
-                success=success,
-                message="Cache registered successfully" if success else "Registration failed",
-            )
-        
-        def UpdateNodeStatus(self, request, context):
-            """Handle UpdateNodeStatus RPC"""
-            status = {
-                "available_memory": request.status.available_memory,
-                "total_memory": request.status.total_memory,
-                "active_requests": request.status.active_requests,
-                "load_factor": request.status.load_factor,
-            }
-            
-            success = self.server.update_node_status(request.node_id, status)
-            
-            return metadata_pb2.UpdateNodeStatusResponse(success=success)
-else:
-    # Dummy class when gRPC is not available
-    class MetadataServicer:
-        pass
 
 
 def main():
