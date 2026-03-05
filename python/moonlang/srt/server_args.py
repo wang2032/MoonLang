@@ -4271,6 +4271,44 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
 
+        # Global KV Cache (MoonLang Phase 1 & 2)
+        parser.add_argument(
+            "--enable-global-cache",
+            action="store_true",
+            default=ServerArgs.enable_global_cache,
+            help="Enable global KV cache across multiple nodes using Mooncake metadata server.",
+        )
+        parser.add_argument(
+            "--global-cache-metadata-server",
+            type=str,
+            default=ServerArgs.global_cache_metadata_server,
+            help="Metadata server address for global cache coordination (e.g., 'localhost:8999').",
+        )
+        parser.add_argument(
+            "--global-cache-query-timeout",
+            type=float,
+            default=ServerArgs.global_cache_query_timeout,
+            help="Timeout in seconds for querying global cache metadata.",
+        )
+        parser.add_argument(
+            "--global-cache-transfer-timeout",
+            type=float,
+            default=ServerArgs.global_cache_transfer_timeout,
+            help="Timeout in seconds for RDMA cache transfer operations.",
+        )
+        parser.add_argument(
+            "--enable-remote-cache-fetch",
+            action="store_true",
+            default=ServerArgs.enable_remote_cache_fetch,
+            help="Enable Phase 2: Fetch remote KV cache via RDMA transfer.",
+        )
+        parser.add_argument(
+            "--enable-cache-aware-scheduling",
+            action="store_true",
+            default=ServerArgs.enable_cache_aware_scheduling,
+            help="Enable Phase 2: Route requests to nodes with existing cache.",
+        )
+
         # Mamba Cache
         parser.add_argument(
             "--max-mamba-cache-size",
